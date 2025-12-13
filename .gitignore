@@ -62,8 +62,9 @@ data/*.pkl
 *.hdf5
 
 # DVC
-.dvc/
-.dvcignore
+.dvc/cache
+.dvc/tmp
+.dvc/plots
 
 # Docker
 .dockerignore
