@@ -156,6 +156,19 @@ jobs:
           python3 src/explainability.py
           echo "SHAP analysis complete"
 
+      - name: Publish SHAP Plots to CML
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "Publishing SHAP plots..."
+          for plot in shap_plots/*.png; do
+            if [ -f "$plot" ]; then
+              cml asset publish "$plot" --md >> shap_assets.md
+            fi
+          done
+          echo "SHAP plots published"
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Run Drift Detection
         env:
           MLFLOW_TRACKING_URI: ${{ secrets.MLOPS_TRACKING_URI }}
@@ -181,7 +194,14 @@ jobs:
           fi
           
           if [ -f shap_report.md ]; then
-            cat shap_report.md >> report.md
+            echo "### 🔍 SHAP Explainability Analysis" >> report.md
+            echo "" >> report.md
+            if [ -f shap_assets.md ]; then
+              # Replace local paths with published URLs
+              while IFS= read -r line; do
+                echo "$line" >> report.md
+              done < shap_assets.md
+            fi
             echo "" >> report.md
           fi
 

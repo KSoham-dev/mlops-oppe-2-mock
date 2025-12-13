@@ -48,3 +48,17 @@ for i in range(num_classes):
 print("\nAll SHAP plots saved to shap_plots/")
 print("  - Beeswarm plots: Show feature effects for each class")
 print("  - Bar plots: Show feature importance for each class")
+
+# Generate markdown report for CML
+with open("shap_report.md", "w") as f:
+    f.write("## 🔍 SHAP Explainability Analysis\n\n")
+    f.write("SHAP (SHapley Additive exPlanations) values explain the contribution of each feature to the model's predictions.\n\n")
+    
+    for i, class_name in enumerate(class_names):
+        f.write(f"### {class_name.capitalize()} Class\n\n")
+        f.write(f"#### Feature Impact (Beeswarm Plot)\n")
+        f.write(f"![SHAP Beeswarm - {class_name}](shap_plots/shap_summary_beeswarm_{class_name}.png)\n\n")
+        f.write(f"#### Feature Importance (Bar Plot)\n")
+        f.write(f"![SHAP Bar - {class_name}](shap_plots/shap_summary_bar_{class_name}.png)\n\n")
+
+print("\n✓ SHAP report saved to shap_report.md")
