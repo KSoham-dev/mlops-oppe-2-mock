@@ -1,0 +1,445 @@
+name: cd.yml
+
+on:
+  workflow_dispatch:
+    inputs:
+      image-tag:
+        description: 'Docker image tag to deploy'
+        required: true
+        type: string
+      triggered-by:
+        description: 'Commit SHA that triggered this deployment'
+        required: false
+        type: string
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: clean-vista-473214-i6
+  AR_REGION: us-central1
+  AR_REPOSITORY: iris-classifier-docker
+  IMAGE_NAME: iris-classifier-fastapi
+  GKE_CLUSTER: iris-classifier-cluster
+  GKE_ZONE: us-east1
+  DEPLOYMENT_NAME: iris-classifier-fastapi
+  MANIFEST_PATH: k8s/deployment.yaml
+  DEPLOYMENT_TIMEOUT: 5m
+  IMAGE_TAG: ${{ inputs.image-tag }}
+  
+jobs:
+
+  infrastructure-setup:
+    name: Setup GKE Infrastructure
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      cluster-exists: ${{ steps.check-cluster.outputs.exists }}
+    
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Check for existing GKE Cluster
+        id: check-cluster
+        run: |
+          echo "Checking for cluster ${{ env.GKE_CLUSTER }}..."
+          if gcloud container clusters describe ${{ env.GKE_CLUSTER }} \
+            --zone ${{ env.GKE_ZONE }} \
+            --project ${{ env.PROJECT_ID }} \
+            --quiet 2>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Cluster ${{ env.GKE_CLUSTER }} already exists"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Cluster not found"
+          fi
+
+      - name: Create GKE Cluster
+        if: steps.check-cluster.outputs.exists == 'false'
+        run: |
+          echo "Creating new GKE cluster..."
+          gcloud container clusters create ${{ env.GKE_CLUSTER }} \
+              --zone ${{ env.GKE_ZONE }} \
+              --num-nodes=1 \
+              --machine-type=e2-small \
+              --release-channel=regular \
+              --project=${{ env.PROJECT_ID }}
+          echo "Cluster created successfully"
+
+  deploy:
+    name: Deploy Application
+    runs-on: ubuntu-latest
+    needs: infrastructure-setup
+    timeout-minutes: 30
+    outputs:
+      deployment-url: ${{ steps.get-url.outputs.url }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Get GKE Credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER }}
+          location: ${{ env.GKE_ZONE }}
+
+      - name: Verify cluster connectivity
+        run: |
+          echo "Verifying cluster connectivity..."
+          kubectl cluster-info
+
+      - name: Create or Update Kubernetes Secrets
+        run: |
+          echo "Managing Kubernetes secrets..."
+          
+          # Create temporary file for Service Account JSON (secure)
+          umask 077
+          echo '${{ secrets.GCP_SA_KEY }}' > ./gcp-sa-key.json
+          
+          # Create or update the secret (idempotent)
+          kubectl create secret generic iris-classifier-secrets \
+            --from-file=gcp-sa-key.json=./gcp-sa-key.json \
+            --from-literal=MLOPS_TRACKING_URI='${{ secrets.MLOPS_TRACKING_URI }}' \
+            --dry-run=client -o yaml | kubectl apply -f -
+            
+          # Securely clean up
+          shred -u ./gcp-sa-key.json 2>/dev/null || rm -f ./gcp-sa-key.json
+          echo "Secrets configured successfully"
+
+      - name: Update Image Tag via Kustomize
+        working-directory: ./k8s
+        run: |
+          # Create kustomization.yaml
+          cat <<EOF > kustomization.yaml
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          resources:
+            - deployment.yaml
+          images:
+            - name: ${{ env.AR_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}
+              newTag: ${{ env.IMAGE_TAG }}
+          EOF
+          
+          # Generate the final manifest using kubectl's built-in kustomize
+          kubectl kustomize . > final_manifest.yaml
+          
+          echo "Manifest generated successfully."
+          echo "Deploying image: ${{ env.AR_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          echo "Updated image:"
+          grep "image:" final_manifest.yaml
+
+      - name: Apply Kubernetes Deployment
+        run: |
+          echo "Deploying to Kubernetes..."
+          kubectl apply -f k8s/final_manifest.yaml
+          echo "Manifest applied"
+
+      - name: Wait for Deployment Rollout
+        run: |
+          echo "Waiting for deployment rollout..."
+          kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} --timeout=${{ env.DEPLOYMENT_TIMEOUT }}
+          echo "Deployment rolled out successfully"
+
+      - name: Verify Deployment Health
+        run: |
+          echo "Verifying deployment health..."
+          
+          # Get deployment status
+          kubectl get deployment ${{ env.DEPLOYMENT_NAME }} -o wide
+          
+          # Get pod status
+          echo ""
+          echo "Pod Status:"
+          kubectl get pods -l app=${{ env.DEPLOYMENT_NAME }} -o wide
+          
+          # Check pod readiness
+          READY_PODS=$(kubectl get pods -l app=${{ env.DEPLOYMENT_NAME }} -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' | grep -o "True" | wc -l)
+          TOTAL_PODS=$(kubectl get pods -l app=${{ env.DEPLOYMENT_NAME }} --no-headers | wc -l)
+          
+          echo ""
+          echo "Ready Pods: ${READY_PODS}/${TOTAL_PODS}"
+          
+          if [ "$READY_PODS" -eq "0" ]; then
+            echo "No pods are ready!"
+            kubectl describe pods -l app=${{ env.DEPLOYMENT_NAME }}
+            exit 1
+          fi
+          
+          echo "Deployment health check passed"
+
+      - name: Get Service Information
+        id: get-url
+        run: |
+          echo "Fetching service information..."
+          
+          # Wait for external IP (with timeout)
+          for i in {1..30}; do
+            EXTERNAL_IP=$(kubectl get service ${{ env.DEPLOYMENT_NAME }}-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+            if [ -n "$EXTERNAL_IP" ]; then
+              echo "url=http://${EXTERNAL_IP}" >> $GITHUB_OUTPUT
+              echo "Service URL: http://${EXTERNAL_IP}"
+              break
+            fi
+            echo "Waiting for external IP... (attempt $i/30)"
+            sleep 10
+          done
+          
+          # Show service details
+          echo ""
+          echo "Service Details:"
+          kubectl get service ${{ env.DEPLOYMENT_NAME }}-service -o wide
+          
+          echo ""
+          echo "Endpoints:"
+          kubectl get endpoints ${{ env.DEPLOYMENT_NAME }}-service
+
+      - name: Deployment Summary
+        if: success()
+        run: |
+          echo "## Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image Tag:** \`${{ env.IMAGE_TAG }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered By:** \`${{ inputs.triggered-by }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Cluster:** \`${{ env.GKE_CLUSTER }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Full Image:** \`${{ env.AR_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}\`" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -n "${{ steps.get-url.outputs.url }}" ]; then
+            echo "**URL:** ${{ steps.get-url.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Rollback on Failure
+        if: failure()
+        run: |
+          echo "Deployment failed! Initiating rollback..."
+          kubectl rollout undo deployment/${{ env.DEPLOYMENT_NAME }} || true
+          echo "Rollback initiated. Check cluster status manually."
+
+  stress-test:
+    name: Stress Test and Auto-Scaling Validation
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: success()
+    timeout-minutes: 30
+    env:
+      PROJECT_ID: clean-vista-473214-i6
+      AR_REGION: us-central1
+      AR_REPOSITORY: iris-classifier-docker
+      IMAGE_NAME: iris-classifier-fastapi
+      GKE_CLUSTER: iris-classifier-cluster
+      GKE_ZONE: us-east1
+      DEPLOYMENT_NAME: iris-classifier-fastapi
+    
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Get GKE Credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER }}
+          location: ${{ env.GKE_ZONE }}
+
+      - name: Setup wrk
+        run: |
+          echo "Installing wrk..."
+          sudo apt-get update > /dev/null 2>&1
+          sudo apt-get install -y build-essential libssl-dev git > /dev/null 2>&1
+          git clone https://github.com/wg/wrk.git /tmp/wrk 2>&1 | grep -v "Cloning\|remote:" || true
+          cd /tmp/wrk
+          echo "Building wrk (this may take a minute)..."
+          make > /dev/null 2>&1
+          sudo cp wrk /usr/local/bin/
+          wrk --version || echo "wrk installed successfully"
+          echo "✓ wrk installation complete"
+
+      - name: Wait for Service to be Ready
+        run: |
+          echo "Waiting for service to be fully ready..."
+          sleep 30
+
+      - name: Get Service URL
+        id: get-service-url
+        run: |
+          SERVICE_URL="${{ needs.deploy.outputs.deployment-url }}"
+          if [ -z "$SERVICE_URL" ]; then
+            echo "Error: Service URL not available from deployment"
+            exit 1
+          fi
+          echo "service-url=${SERVICE_URL}" >> $GITHUB_OUTPUT
+          echo "Testing endpoint: ${SERVICE_URL}/health"
+
+      - name: Warmup Test
+        run: |
+          SERVICE_URL="${{ steps.get-service-url.outputs.service-url }}"
+          echo "Running warmup test..."
+          for i in {1..10}; do
+            curl -f "${SERVICE_URL}/health" || echo "Warmup request $i completed"
+            sleep 1
+          done
+
+      - name: Check Initial Pod Count
+        run: |
+          echo "Initial pod count (should be 1):"
+          kubectl get pods -l app=${{ env.DEPLOYMENT_NAME }}
+          INITIAL_PODS=$(kubectl get pods -l app=${{ env.DEPLOYMENT_NAME }} --field-selector=status.phase=Running --no-headers | wc -l)
+          echo "Running pods: $INITIAL_PODS"
+          echo "INITIAL_PODS=$INITIAL_PODS" >> $GITHUB_ENV
+
+      - name: Stress Test - 1000 Concurrent Connections (Single Pod Bottleneck)
+        run: |
+          SERVICE_URL="${{ steps.get-service-url.outputs.service-url }}"
+          echo "## Test 1: 1000 Concurrent Connections" | tee stress_test_results.txt
+          echo "Purpose: Demonstrate bottleneck with single pod" | tee -a stress_test_results.txt
+          echo "Configuration: 4 threads, 1000 connections, 60 seconds" | tee -a stress_test_results.txt
+          echo "" | tee -a stress_test_results.txt
+          wrk -t4 -c1000 -d60s --timeout 30s "${SERVICE_URL}/health" | tee -a stress_test_results.txt
+          echo "" | tee -a stress_test_results.txt
+          echo "---" | tee -a stress_test_results.txt
+          echo "" | tee -a stress_test_results.txt
+
+      - name: Monitor Auto-Scaling (After 1000 connections)
+        run: |
+          echo "Monitoring HPA and pod scaling..."
+          sleep 15
+          echo "HPA Status:"
+          kubectl get hpa ${{ env.DEPLOYMENT_NAME }}-hpa
+          echo "" 
+          echo "Pod Status:"
+          kubectl get pods -l app=${{ env.DEPLOYMENT_NAME }}
+          PODS_AFTER_1K=$(kubectl get pods -l app=${{ env.DEPLOYMENT_NAME }} --field-selector=status.phase=Running --no-headers | wc -l)
+          echo "Running pods after 1000 connections: $PODS_AFTER_1K"
+          echo "PODS_AFTER_1K=$PODS_AFTER_1K" >> $GITHUB_ENV
+
+      - name: Wait for Auto-Scaling to Complete
+        run: |
+          echo "Waiting for auto-scaling to stabilize..."
+          for i in {1..12}; do
+            CURRENT_PODS=$(kubectl get pods -l app=${{ env.DEPLOYMENT_NAME }} --field-selector=status.phase=Running --no-headers | wc -l)
+            echo "Attempt $i/12: Current running pods: $CURRENT_PODS"
+            kubectl get hpa ${{ env.DEPLOYMENT_NAME }}-hpa
+            if [ "$CURRENT_PODS" -ge "2" ]; then
+              echo "Auto-scaling detected! Pods scaled to $CURRENT_PODS"
+              break
+            fi
+            sleep 10
+          done
+          sleep 20
+
+      - name: Stress Test - 2000 Concurrent Connections (With Auto-Scaling)
+        run: |
+          SERVICE_URL="${{ steps.get-service-url.outputs.service-url }}"
+          echo "## Test 2: 2000 Concurrent Connections" | tee -a stress_test_results.txt
+          echo "Purpose: Observe performance with auto-scaled pods" | tee -a stress_test_results.txt
+          echo "Configuration: 8 threads, 2000 connections, 60 seconds" | tee -a stress_test_results.txt
+          echo "" | tee -a stress_test_results.txt
+          wrk -t8 -c2000 -d60s --timeout 30s "${SERVICE_URL}/health" | tee -a stress_test_results.txt
+          echo "" | tee -a stress_test_results.txt
+          echo "---" | tee -a stress_test_results.txt
+          echo "" | tee -a stress_test_results.txt
+
+      - name: Monitor Final Pod Count
+        run: |
+          echo "Final pod count after 2000 connections:"
+          kubectl get pods -l app=${{ env.DEPLOYMENT_NAME }}
+          echo ""
+          echo "HPA Status:"
+          kubectl get hpa ${{ env.DEPLOYMENT_NAME }}-hpa
+          FINAL_PODS=$(kubectl get pods -l app=${{ env.DEPLOYMENT_NAME }} --field-selector=status.phase=Running --no-headers | wc -l)
+          echo "Final running pods: $FINAL_PODS"
+          echo "FINAL_PODS=$FINAL_PODS" >> $GITHUB_ENV
+
+      - name: Additional Load Test - Peak Performance
+        run: |
+          SERVICE_URL="${{ steps.get-service-url.outputs.service-url }}"
+          echo "## Test 3: Peak Load Test" | tee -a stress_test_results.txt
+          echo "Purpose: Test maximum throughput with scaled pods" | tee -a stress_test_results.txt
+          echo "Configuration: 12 threads, 1500 connections, 45 seconds" | tee -a stress_test_results.txt
+          echo "" | tee -a stress_test_results.txt
+          wrk -t12 -c1500 -d45s --timeout 30s "${SERVICE_URL}/health" | tee -a stress_test_results.txt
+          echo "" | tee -a stress_test_results.txt
+
+      - name: Get Detailed HPA Metrics
+        run: |
+          echo "Detailed HPA Information:"
+          kubectl describe hpa ${{ env.DEPLOYMENT_NAME }}-hpa
+          echo ""
+          echo "Pod Resource Usage:"
+          kubectl top pods -l app=${{ env.DEPLOYMENT_NAME }} || echo "Metrics server may not be available"
+
+      - name: Generate Comprehensive Summary
+        if: always()
+        run: |
+          echo "# Stress Test and Auto-Scaling Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- **Endpoint:** \`${{ steps.get-service-url.outputs.service-url }}/health\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **HPA Configuration:** Min: 1 pod, Max: 3 pods, CPU Target: 50%" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## Auto-Scaling Behavior" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Pod Count | Description |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-----------|-------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Initial | ${{ env.INITIAL_PODS }} | Starting state |" >> $GITHUB_STEP_SUMMARY
+          echo "| After 1000 conn | ${{ env.PODS_AFTER_1K }} | During first stress test |" >> $GITHUB_STEP_SUMMARY
+          echo "| After 2000 conn | ${{ env.FINAL_PODS }} | After increased load |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f stress_test_results.txt ]; then
+            echo '<details>' >> $GITHUB_STEP_SUMMARY
+            echo '<summary>Detailed wrk Output (Click to expand)</summary>' >> $GITHUB_STEP_SUMMARY
+            echo '' >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat stress_test_results.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo '</details>' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "WARNING: No stress test results available" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Key Observations" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ env.INITIAL_PODS }}" -eq "1" ] && [ "${{ env.FINAL_PODS }}" -gt "1" ]; then
+            echo "**Auto-scaling successful**: System scaled from 1 to ${{ env.FINAL_PODS }} pods" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Auto-scaling status**: Initial: ${{ env.INITIAL_PODS }}, Final: ${{ env.FINAL_PODS }}" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Bottleneck Analysis" >> $GITHUB_STEP_SUMMARY
+          echo "- **Test 1 (1000 conn)**: Single pod under stress - observe response times and error rates" >> $GITHUB_STEP_SUMMARY
+          echo "- **Test 2 (2000 conn)**: Doubled load - compare performance with auto-scaled pods" >> $GITHUB_STEP_SUMMARY
+          echo "- **Test 3 (1500 conn)**: Peak performance validation with multiple pods" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "NOTE: Compare latency and requests/sec between Test 1 and Test 2 to see auto-scaling benefits" >> $GITHUB_STEP_SUMMARY
