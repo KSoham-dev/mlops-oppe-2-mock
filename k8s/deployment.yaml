@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iris-classifier-fastapi
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: iris-classifier-fastapi
+  template:
+    metadata:
+      labels:
+        app: iris-classifier-fastapi
+    spec:
+      containers:
+      - name: iris-classifier-fastapi
+        # This image will be overridden by the CI pipeline, but this placeholder is fine
+        image: us-central1-docker.pkg.dev/clean-vista-473214-i6/iris-classifier-docker/iris-classifier-fastapi:latest
+        ports:
+        - containerPort: 8000
+        env:
+          - name: MLOPS_TRACKING_URI
+            valueFrom:
+              secretKeyRef:
+                name: iris-classifier-secrets
+                key: MLOPS_TRACKING_URI
+          - name: GOOGLE_APPLICATION_CREDENTIALS
+            value: "/secrets/gcp-sa-key.json"
+        volumeMounts:
+          - name: gcp-sa-volume       # Matches the volume name below
+            mountPath: "/secrets"
+            readOnly: true
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+      
+      # 'volumes' must be a sibling of 'containers' (aligned with it)
+      volumes:
+        - name: gcp-sa-volume         # Matches the volumeMount name above
+          secret:
+            secretName: iris-classifier-secrets
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: iris-classifier-fastapi-service
+spec:
+  type: LoadBalancer
+  selector:
+    app: iris-classifier-fastapi
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8000
+  
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: iris-classifier-fastapi-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: iris-classifier-fastapi
+
+  minReplicas: 1
+  maxReplicas: 3
+
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50

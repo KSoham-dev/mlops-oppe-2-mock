@@ -1,0 +1,363 @@
+name: ci.yml
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+
+env:
+  PROJECT_ID: clean-vista-473214-i6
+  AR_REGION: us-central1
+  AR_REPOSITORY: iris-classifier-docker
+  IMAGE_NAME: iris-classifier-fastapi
+
+jobs:
+  code-quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install linting dependencies
+        run: |
+          pip install flake8 black isort mypy
+
+      - name: Run Black (formatting check)
+        run: |
+          black --check src/ tests/ || echo "Black formatting issues found"
+
+      - name: Run isort (import sorting check)
+        run: |
+          isort --check-only src/ tests/ || echo "Import sorting issues found"
+
+      - name: Run Flake8 (linting)
+        run: |
+          flake8 src/ tests/ --max-line-length=120 --extend-ignore=E203,W503 || echo "Flake8 issues found"
+
+      - name: Run MyPy (type checking)
+        continue-on-error: true
+        run: |
+          mypy src/ --ignore-missing-imports || echo "MyPy type checking issues found"
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install dvc[gcs]
+
+      - name: Google Cloud Authentication
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+      - name: Verify DVC setup
+        run: |
+          echo "Checking DVC directory..."
+          ls -la .dvc/ || echo "No .dvc directory"
+          cat .dvc/config || echo "No .dvc/config found"
+          git status
+
+      - name: Pull Data using DVC
+        run: |
+          dvc pull
+
+      - name: Run Unit Tests
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLOPS_TRACKING_URI }}
+        run: |
+          pytest tests/test_api.py -v --tb=short
+
+  model-validation:
+    name: Model Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Setup CML
+        uses: iterative/setup-cml@v2.0.1
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install dvc[gcs] shap matplotlib
+      
+      - name: Google Cloud Authentication
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+      - name: Verify DVC setup
+        run: |
+          echo "Checking DVC directory..."
+          ls -la .dvc/ || echo "No .dvc directory"
+          cat .dvc/config || echo "No .dvc/config found"
+
+      - name: Pull Data using DVC
+        run: |
+          dvc pull
+
+      - name: Load Model from MLflow
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLOPS_TRACKING_URI }}
+        run: |
+          python3 -m src.get_model
+
+      - name: Run Model Tests
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLOPS_TRACKING_URI }}
+        run: |
+          pytest tests/test_model.py -v &> test_output.txt 
+
+      - name: Generate SHAP Explanations
+        run: |
+          echo "Generating SHAP explainability plots..."
+          python3 src/explainability.py
+          echo "SHAP analysis complete"
+
+      - name: Publish SHAP Plots to CML
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "Publishing SHAP plots..."
+          for plot in shap_plots/*.png; do
+            if [ -f "$plot" ]; then
+              cml asset publish "$plot" --md >> shap_assets.md
+            fi
+          done
+          echo "SHAP plots published"
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Drift Detection
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLOPS_TRACKING_URI }}
+        run: |
+          echo "Running drift detection with MLflow model..."
+          python3 -m src.drift_detection
+          echo "Drift detection complete"
+
+      - name: Create CML Report
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "# CML Test & Evaluation Report" > report.md
+          echo "" >> report.md
+          echo "### Model Validation Results" >> report.md
+          echo "\`\`\`" >> report.md
+          cat test_output.txt >> report.md
+          echo "\`\`\`" >> report.md
+          echo "" >> report.md
+          
+          if [ -f metrics.md ]; then
+            cat metrics.md >> report.md
+            echo "" >> report.md
+          fi
+          
+          if [ -f shap_report.md ]; then
+            echo "### 🔍 SHAP Explainability Analysis" >> report.md
+            echo "" >> report.md
+            if [ -f shap_assets.md ]; then
+              # Replace local paths with published URLs
+              while IFS= read -r line; do
+                echo "$line" >> report.md
+              done < shap_assets.md
+            fi
+            echo "" >> report.md
+          fi
+
+          if [ -f drift_impact_report.html ]; then
+            echo "### Data Drift Detection" >> report.md
+            echo "" >> report.md
+            echo "✅ Drift detection analysis completed. View the [detailed drift report](drift_impact_report.html)" >> report.md
+            echo "" >> report.md
+          fi
+
+          cml comment create report.md
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install safety
+        run: |
+          pip install safety
+
+      - name: Run Safety check
+        continue-on-error: true
+        run: |
+          pip install -r requirements.txt
+          safety check --json || echo "Security vulnerabilities found"
+
+      - name: Run Bandit (security linting)
+        continue-on-error: true
+        run: |
+          pip install bandit
+          bandit -r src/ -f json || echo "Bandit security issues found"
+
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [code-quality, unit-tests, model-validation, security-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    timeout-minutes: 20
+    outputs:
+      image-tag: ${{ steps.build-info.outputs.image-tag }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+    
+      - name: Setup CML
+        uses: iterative/setup-cml@v2
+
+      - name: Install DVC
+        run: |
+          pip install --upgrade pip
+          pip install dvc dvc-gs dvc[gcs]
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=moby/buildkit:latest
+        
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Pull data from DVC
+        run: |
+          echo "Pulling data from DVC..."
+          dvc pull
+          echo "Data pulled successfully"
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ env.AR_REGION }}-docker.pkg.dev --quiet
+        
+      - name: Generate build info
+        id: build-info
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          IMAGE_TAG="${SHORT_SHA}"
+          echo "image-tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "short-sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "build-date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+        
+      - name: Build and Push Docker Image
+        env:
+          IMAGE_TAG: ${{ steps.build-info.outputs.image-tag }}
+        run: |
+          FULL_IMAGE_TAG="${{ env.AR_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG}"
+          LATEST_TAG="${{ env.AR_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}:latest"
+          
+          echo "Building Docker image..."
+          echo "Image tags: ${IMAGE_TAG}, latest"
+          
+          docker build \
+            --tag "${FULL_IMAGE_TAG}" \
+            --tag "${LATEST_TAG}" \
+            --label "git.commit=${{ github.sha }}" \
+            --label "git.branch=${{ github.ref_name }}" \
+            --label "build.date=${{ steps.build-info.outputs.build-date }}" \
+            --cache-from type=registry,ref="${LATEST_TAG}" \
+            --cache-to type=inline \
+            .
+          
+          echo "Pushing images to Artifact Registry..."
+          docker push "${FULL_IMAGE_TAG}"
+          docker push "${LATEST_TAG}"
+          echo "Images pushed successfully"
+
+      - name: Build Summary
+        if: success()
+        run: |
+          echo "## Build Successful" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image Tag:** \`${{ steps.build-info.outputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Build Date:** \`${{ steps.build-info.outputs.build-date }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Full Image:** \`${{ env.AR_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ steps.build-info.outputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
+
+  trigger-deployment:
+    name: Trigger Deployment
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Trigger CD Workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Triggering CD workflow with image tag: ${{ needs.build-and-push.outputs.image-tag }}"
+          gh workflow run cd.yml \
+            --repo ${{ github.repository }} \
+            --ref ${{ github.ref_name }} \
+            --field image-tag=${{ needs.build-and-push.outputs.image-tag }} \
+            --field triggered-by="${{ github.sha }}"
+          echo "CD workflow triggered successfully"
