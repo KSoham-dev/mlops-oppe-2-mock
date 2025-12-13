@@ -85,6 +85,13 @@ jobs:
         with:
           credentials_json: '${{ secrets.GCP_SA_KEY }}'
 
+      - name: Verify DVC setup
+        run: |
+          echo "Checking DVC directory..."
+          ls -la .dvc/ || echo "No .dvc directory"
+          cat .dvc/config || echo "No .dvc/config found"
+          git status
+
       - name: Pull Data using DVC
         run: |
           dvc pull
@@ -120,6 +127,12 @@ jobs:
         uses: google-github-actions/auth@v3
         with:
           credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+      - name: Verify DVC setup
+        run: |
+          echo "Checking DVC directory..."
+          ls -la .dvc/ || echo "No .dvc directory"
+          cat .dvc/config || echo "No .dvc/config found"
 
       - name: Pull Data using DVC
         run: |
