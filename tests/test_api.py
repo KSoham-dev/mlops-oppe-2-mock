@@ -1,6 +1,6 @@
 import pytest
-import os
 from fastapi.testclient import TestClient
+
 from src.main import app
 
 
@@ -36,7 +36,7 @@ def test_model_info_endpoint(client):
     """Test model info endpoint returns model details"""
     response = client.get("/model_info")
     assert response.status_code in [200, 503]  # May fail if model not available
-    
+
     if response.status_code == 200:
         data = response.json()
         assert "model_name" in data
@@ -52,13 +52,13 @@ def test_predict_endpoint_valid_input(client):
         "sepal_length": 5.1,
         "sepal_width": 3.5,
         "petal_length": 1.4,
-        "petal_width": 0.2
+        "petal_width": 0.2,
     }
     response = client.post("/predict", json=payload)
-    
+
     # May return 503 if model not loaded
     assert response.status_code in [200, 503]
-    
+
     if response.status_code == 200:
         data = response.json()
         assert "prediction" in data
@@ -73,13 +73,28 @@ def test_predict_endpoint_all_species(client):
     """Test prediction for all three iris species"""
     test_samples = [
         # Setosa
-        {"sepal_length": 5.1, "sepal_width": 3.5, "petal_length": 1.4, "petal_width": 0.2},
+        {
+            "sepal_length": 5.1,
+            "sepal_width": 3.5,
+            "petal_length": 1.4,
+            "petal_width": 0.2,
+        },
         # Versicolor
-        {"sepal_length": 6.7, "sepal_width": 3.0, "petal_length": 5.0, "petal_width": 1.7},
+        {
+            "sepal_length": 6.7,
+            "sepal_width": 3.0,
+            "petal_length": 5.0,
+            "petal_width": 1.7,
+        },
         # Virginica
-        {"sepal_length": 7.2, "sepal_width": 3.0, "petal_length": 5.8, "petal_width": 1.6}
+        {
+            "sepal_length": 7.2,
+            "sepal_width": 3.0,
+            "petal_length": 5.8,
+            "petal_width": 1.6,
+        },
     ]
-    
+
     for sample in test_samples:
         response = client.post("/predict", json=sample)
         if response.status_code == 200:
@@ -93,7 +108,7 @@ def test_predict_endpoint_missing_field(client):
     payload = {
         "sepal_length": 5.1,
         "sepal_width": 3.5,
-        "petal_length": 1.4
+        "petal_length": 1.4,
         # Missing petal_width
     }
     response = client.post("/predict", json=payload)
@@ -106,7 +121,7 @@ def test_predict_endpoint_invalid_type(client):
         "sepal_length": "invalid",
         "sepal_width": 3.5,
         "petal_length": 1.4,
-        "petal_width": 0.2
+        "petal_width": 0.2,
     }
     response = client.post("/predict", json=payload)
     assert response.status_code == 422  # Validation error
@@ -118,7 +133,7 @@ def test_predict_endpoint_negative_values(client):
         "sepal_length": -5.1,
         "sepal_width": -3.5,
         "petal_length": -1.4,
-        "petal_width": -0.2
+        "petal_width": -0.2,
     }
     response = client.post("/predict", json=payload)
     # Should either accept or return error
@@ -128,13 +143,23 @@ def test_predict_endpoint_negative_values(client):
 def test_batch_predict_endpoint_valid(client):
     """Test batch prediction with valid inputs"""
     payload = [
-        {"sepal_length": 5.1, "sepal_width": 3.5, "petal_length": 1.4, "petal_width": 0.2},
-        {"sepal_length": 6.7, "sepal_width": 3.0, "petal_length": 5.0, "petal_width": 1.7}
+        {
+            "sepal_length": 5.1,
+            "sepal_width": 3.5,
+            "petal_length": 1.4,
+            "petal_width": 0.2,
+        },
+        {
+            "sepal_length": 6.7,
+            "sepal_width": 3.0,
+            "petal_length": 5.0,
+            "petal_width": 1.7,
+        },
     ]
     response = client.post("/batch_predict", json=payload)
-    
+
     assert response.status_code in [200, 503]
-    
+
     if response.status_code == 200:
         data = response.json()
         assert "predictions" in data
@@ -156,7 +181,12 @@ def test_batch_predict_endpoint_empty(client):
 def test_batch_predict_endpoint_too_many(client):
     """Test batch prediction with too many samples"""
     payload = [
-        {"sepal_length": 5.1, "sepal_width": 3.5, "petal_length": 1.4, "petal_width": 0.2}
+        {
+            "sepal_length": 5.1,
+            "sepal_width": 3.5,
+            "petal_length": 1.4,
+            "petal_width": 0.2,
+        }
     ] * 101  # 101 samples (max is 100)
     response = client.post("/batch_predict", json=payload)
     assert response.status_code == 400  # Invalid sample count
@@ -165,10 +195,15 @@ def test_batch_predict_endpoint_too_many(client):
 def test_batch_predict_single_sample(client):
     """Test batch prediction with single sample"""
     payload = [
-        {"sepal_length": 5.1, "sepal_width": 3.5, "petal_length": 1.4, "petal_width": 0.2}
+        {
+            "sepal_length": 5.1,
+            "sepal_width": 3.5,
+            "petal_length": 1.4,
+            "petal_width": 0.2,
+        }
     ]
     response = client.post("/batch_predict", json=payload)
-    
+
     if response.status_code == 200:
         data = response.json()
         assert len(data["predictions"]) == 1
@@ -181,7 +216,7 @@ def test_train_endpoint(client):
     response = client.post("/train")
     # Should return either success or error
     assert response.status_code in [200, 500, 503]
-    
+
     if response.status_code == 200:
         data = response.json()
         assert "status" in data
@@ -196,17 +231,17 @@ def test_predict_response_schema(client):
         "sepal_length": 5.1,
         "sepal_width": 3.5,
         "petal_length": 1.4,
-        "petal_width": 0.2
+        "petal_width": 0.2,
     }
     response = client.post("/predict", json=payload)
-    
+
     if response.status_code == 200:
         data = response.json()
         # Check all required fields exist
         required_fields = ["prediction", "confidence", "timestamp", "model_version"]
         for field in required_fields:
             assert field in data, f"Missing required field: {field}"
-        
+
         # Check data types
         assert isinstance(data["prediction"], str)
         assert isinstance(data["confidence"], (int, float))
